@@ -19,77 +19,133 @@ fn is_text(data: &[u8]) -> bool {
 }
 
 fn copy_to_clipboard(text: &str, verbose: bool) -> Result<(), String> {
-    let methods = [
-        // KDE specific
-        (vec!["qdbus", "org.kde.klipper", "/klipper", "setClipboardContents"], "KDE Klipper"),
-        // Wayland
-        (vec!["wl-copy"], "wl-copy"),
-        // X11 methods
-        (vec!["xclip", "-selection", "clipboard"], "xclip"),
-        (vec!["xsel", "-i", "-b"], "xsel"),
-    ];
+    // Check the desktop environment
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_uppercase();
+    
+    if desktop.contains("KDE") {
+        // KDE-specific methods
+        let kde_methods = [
+            // Try xclip first even on KDE as it's more reliable for large text
+            (vec!["xclip", "-selection", "clipboard"], "xclip"),
+            (vec!["qdbus", "org.kde.klipper", "/klipper", "setClipboardContents"], "KDE Klipper"),
+        ];
 
-    // Try dbus-send first as it's the fallback method you have.
-    let dbus_result = Command::new("dbus-send")
-        .args([
-            "--type=method_call",
-            "--dest=org.kde.klipper",
-            "/klipper",
-            "org.kde.klipper.klipper.setClipboardContents",
-            format!("string:{}", text).as_str(),
-        ])
-        .status();
+        for (cmd, desc) in kde_methods {
+            if verbose {
+                println!("Trying KDE method: {} ({})", cmd.join(" "), desc);
+            }
 
-    // If dbus-send works, return success.
-    if dbus_result.is_ok() && dbus_result.unwrap().success() {
-        if verbose {
-            println!("Successfully copied using dbus-send fallback");
+            // Special handling for qdbus which needs the text as an argument
+            if desc == "KDE Klipper" {
+                let mut command_args = cmd.clone();
+                command_args.push(text);
+                
+                let result = Command::new(&command_args[0])
+                    .args(&command_args[1..])
+                    .status();
+
+                if let Ok(status) = result {
+                    if status.success() {
+                        if verbose {
+                            println!("Successfully copied using {}", desc);
+                        }
+                        return Ok(());
+                    }
+                }
+            } else {
+                // For xclip and other methods that use stdin
+                let mut child = match Command::new(&cmd[0])
+                    .args(&cmd[1..])
+                    .stdin(Stdio::piped())
+                    .spawn() {
+                        Ok(child) => child,
+                        Err(e) => {
+                            if verbose {
+                                eprintln!("Failed to spawn {}: {}", desc, e);
+                            }
+                            continue;
+                        }
+                    };
+
+                if let Some(mut stdin) = child.stdin.take() {
+                    match stdin.write_all(text.as_bytes()) {
+                        Ok(_) => {
+                            drop(stdin);
+                            match child.wait() {
+                                Ok(status) if status.success() => {
+                                    if verbose {
+                                        println!("Successfully copied {} bytes using {}", text.len(), desc);
+                                    }
+                                    return Ok(());
+                                }
+                                _ => continue,
+                            }
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            }
         }
-        return Ok(());
     }
 
-    // Try other methods if dbus-send fails
-    for (cmd, desc) in methods {
+    // Generic X11/Wayland methods for non-KDE environments or if KDE methods failed
+    let generic_methods = [
+        (vec!["xclip", "-selection", "clipboard"], "xclip"),
+        (vec!["xsel", "-i", "-b"], "xsel"),
+        (vec!["wl-copy"], "wl-copy"),
+    ];
+
+    for (cmd, desc) in generic_methods {
         if verbose {
             println!("Trying: {} ({})", cmd.join(" "), desc);
         }
 
-        let result = Command::new(&cmd[0])
+        let mut child = match Command::new(&cmd[0])
             .args(&cmd[1..])
             .stdin(Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                if let Some(mut stdin) = child.stdin.take() {
-                    stdin.write_all(text.as_bytes())?;
-                    drop(stdin);
-                    child.wait().map(|status| status.success())
-                } else {
-                    Ok(false)
+            .spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    if verbose {
+                        eprintln!("Failed to spawn {}: {}", desc, e);
+                    }
+                    continue;
                 }
-            });
+            };
 
-        match result {
-            Ok(true) => {
-                if verbose {
-                    println!("Successfully copied using {}", desc);
+        if let Some(mut stdin) = child.stdin.take() {
+            match stdin.write_all(text.as_bytes()) {
+                Ok(_) => {
+                    drop(stdin);
+                    match child.wait() {
+                        Ok(status) if status.success() => {
+                            if verbose {
+                                println!("Successfully copied {} bytes using {}", text.len(), desc);
+                            }
+                            return Ok(());
+                        }
+                        Ok(_) => {
+                            if verbose {
+                                eprintln!("{} completed but returned error status", desc);
+                            }
+                        }
+                        Err(e) => {
+                            if verbose {
+                                eprintln!("Error waiting for {}: {}", desc, e);
+                            }
+                        }
+                    }
                 }
-                return Ok(());
-            }
-            Ok(false) => {
-                if verbose {
-                    eprintln!("Failed to copy using {}", desc);
-                }
-            }
-            Err(e) => {
-                if verbose {
-                    eprintln!("Error executing {}: {}", desc, e);
+                Err(e) => {
+                    if verbose {
+                        eprintln!("Failed to write to {}: {}", desc, e);
+                    }
                 }
             }
         }
     }
 
-    // If all methods fail, return an error.
-    Err("Failed to copy to clipboard".to_string())
+    Err("Failed to copy to clipboard. Please ensure xclip or xsel is installed.".to_string())
 }
 
 fn main() {
